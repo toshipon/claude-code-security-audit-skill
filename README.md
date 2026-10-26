@@ -228,23 +228,25 @@ claude-code-security-audit-skill/
 - [ ] Auto-fix mode (generate PRs with remediation)
 - [x] Severity scoring with CVSS v4.0 (available in this revision)
 - [x] Custom rule engine (trusted user-defined JSON regex patterns, with execution deadlines)
-- [ ] Integration with external scanners (Semgrep, CodeQL)
+- [x] Integration with external scanners (POSIX runners for installed Semgrep and existing CodeQL databases, plus SARIF import)
 - [x] Continuous monitoring mode (local custom-rule polling with a fixed baseline)
 
 CVSS support is an instruction-based assessment and reporting workflow, not a bundled scoring engine. It requires the FIRST CVSS v4.0 calculator or a verified v4.0 implementation, records metric evidence and calculation sources, and explicitly reports Unscored and N/A findings. See [the scoring guide](plugins/security-audit/skills/security-audit/references/cvss-scoring.md).
 
-### v2.0 workflow support (v1.8.0)
+### v2.0 workflow support (v1.9.0)
 
-Custom rules and local continuous monitoring are available. Auto-fix PRs and external scanner integration still have initial support; their broader automation remains in progress:
+Custom rules, local continuous monitoring, and external scanner runners are available. Auto-fix PR generation remains in progress:
 
 | Item | Available now | Remaining scope |
 |------|---------------|-----------------|
 | Auto-fix PRs | Evidence-based remediation workflow and read-only patch validation | End-to-end automated remediation and PR generation |
 | Custom rule engine | Trusted local JSON regex rules with bounded UTF-8 file scanning and process execution deadlines | Optional language-aware rules; no sandbox or memory quota for untrusted patterns |
-| External scanners | Semgrep / CodeQL SARIF 2.1.0 import | Scanner lifecycle management and broader SARIF coverage |
+| External scanners | POSIX execution of installed Semgrep / existing CodeQL databases with SARIF 2.1.0 normalization | Optional installation/database lifecycle management, Windows runners, and broader SARIF coverage |
 | Continuous monitoring | Compatible snapshot comparison and local polling watch, with optional failure on new findings | Optional scanner-backed monitoring, advisory feeds, and external scheduling |
 
 Use `/security-audit custom`, `scanner`, `monitor`, `watch`, or `fix` to request these agent workflows. The bundled Python 3.10+ helper prints JSON (NDJSON for `watch`) to stdout and does not install scanners, apply patches, create PRs, register schedules, or update baselines. See [workflow commands, limitations, and authorization](plugins/security-audit/skills/security-audit/references/advanced-workflows.md).
+
+Semgrep execution is verified against an actual scanner. CodeQL runner arguments, result normalization, failure handling, and process cleanup are tested with a stand-in executable; running the native CodeQL engine requires a separately prepared local installation, database, and query suite.
 
 From a repository checkout, run the helper tests with:
 

@@ -33,7 +33,31 @@ The helper skips symlinks and `.git`. Included files must be UTF-8 and no larger
 
 ## Semgrep and CodeQL SARIF Import
 
-Run an already installed scanner using reviewed local rules. If a scanner, database, or query pack is unavailable, report **Not Run** with the reason. Do not represent an import test as execution of that scanner.
+Run an already installed scanner using reviewed local rules. If a scanner, database, or query pack is unavailable, report **Not Run** with the reason. Do not represent an import or fake-executable test as execution of that scanner.
+
+### Run an Installed Scanner
+
+On POSIX systems (macOS and Linux), the helper can execute a scanner and import its result in one command:
+
+```bash
+python3 plugins/security-audit/skills/security-audit/scripts/audit_workflow.py run-semgrep \
+  --root /path/to/project --config /path/to/reviewed-semgrep.yml \
+  --timeout 300 > /tmp/semgrep-findings.json
+
+python3 plugins/security-audit/skills/security-audit/scripts/audit_workflow.py run-codeql \
+  --root /path/to/project --database /path/to/existing-database \
+  --suite /path/to/reviewed-suite.qls --timeout 300 > /tmp/codeql-findings.json
+```
+
+`--executable PATH` selects a trusted scanner executable instead of finding `semgrep` or `codeql` on PATH. The helper uses fixed argument arrays without a shell. The configuration or suite must be an existing local file; CodeQL also needs an existing database with matching, up-to-date source. The helper does not install tools, create databases, add `--download`, or request autofixes. Only use reviewed configurations with locally resolved dependencies. It does not block network access by the scanner or by referenced configuration, so local input alone does not guarantee an offline scan.
+
+Scanner output is written to a private temporary SARIF file, then validated through the importer below. Raw stdout and stderr are discarded to avoid exposing source or credentials. Exit zero, a valid SARIF file no larger than 64 MiB, and an unchanged configuration file are required before a snapshot is printed. A nonzero scanner exit is a failed run even if a report was generated. Missing tools, malformed reports, and changed configurations produce status 2 and no snapshot; interruption produces status 130. Timeout is a finite positive number of seconds, defaults to 300, and covers scanner execution; report import and hashing are outside that deadline. On completion, timeout, or interruption, the runner stops its process group, including descendants that remain after the main scanner exits. Processes that deliberately leave that group are outside this cleanup mechanism.
+
+Coverage identity combines the imported scanner metadata with the runner kind, executable path, configuration content hash, and canonical CodeQL database path. Runner snapshots and manually imported snapshots are intentionally incompatible. The helper verifies the selected configuration file before and after execution; changes to referenced files, changes to an executable at the same path, database freshness, and complete scanner coverage still require operator verification. The CodeQL command can update its existing database's query caches. Use a disposable database when its state must be preserved.
+
+The runners currently require POSIX process groups and reject Windows before launching a scanner. Windows users can run their scanner separately and use `import-sarif`.
+
+### Import an Existing Report
 
 Semgrep example using a local configuration and disabled metrics:
 
