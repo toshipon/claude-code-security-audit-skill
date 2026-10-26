@@ -128,10 +128,11 @@ claude-code-security-audit-skill/
 │   └── skills/security-audit/
 │       ├── SKILL.md                      # Main skill (loaded into context)
 │       ├── scripts/
-│       │   └── audit_workflow.py          # Local rules, SARIF import, snapshots, patch validation
+│       │   ├── audit_workflow.py          # Rules, scanner runners, snapshots, workflow CLI
+│       │   └── remediation.py             # Isolated patch validation, tests, commit, draft PR
 │       └── references/                   # Detailed guides (loaded on demand)
 │           ├── cvss-scoring.md           # CVSS v4.0 evidence, calculation, and reporting workflow
-│           ├── advanced-workflows.md     # Initial v2.0 CLI and remediation workflows
+│           ├── advanced-workflows.md     # v2.0 CLI and remediation workflows
 │           ├── nextjs-security.md        # Next.js: Server Actions, Middleware, CSP, CVEs
 │           ├── vercel-security.md        # Vercel: CLI checks + Chrome MCP dashboard
 │           ├── supabase-security.md      # Supabase: RLS SQL queries + Chrome MCP dashboard
@@ -224,8 +225,8 @@ claude-code-security-audit-skill/
 - [x] Secret scanning (git history, build artifacts)
 - [x] LLM/AI security (OWASP Top 10 for LLM)
 
-### v2.0 — Next Generation (In Progress)
-- [ ] Auto-fix mode (generate PRs with remediation)
+### v2.0 — Next Generation (Implemented in This Revision)
+- [x] Auto-fix mode (reviewed patch → isolated tests → local commit or explicitly published draft PR)
 - [x] Severity scoring with CVSS v4.0 (available in this revision)
 - [x] Custom rule engine (trusted user-defined JSON regex patterns, with execution deadlines)
 - [x] Integration with external scanners (POSIX runners for installed Semgrep and existing CodeQL databases, plus SARIF import)
@@ -233,20 +234,20 @@ claude-code-security-audit-skill/
 
 CVSS support is an instruction-based assessment and reporting workflow, not a bundled scoring engine. It requires the FIRST CVSS v4.0 calculator or a verified v4.0 implementation, records metric evidence and calculation sources, and explicitly reports Unscored and N/A findings. See [the scoring guide](plugins/security-audit/skills/security-audit/references/cvss-scoring.md).
 
-### v2.0 workflow support (v1.9.0)
+### v2.0 workflow support (v2.0.0)
 
-Custom rules, local continuous monitoring, and external scanner runners are available. Auto-fix PR generation remains in progress:
+All five roadmap items are implemented within the scopes below. This revision includes reviewed-patch remediation and optional draft PR publication; it does not infer fixes for arbitrary vulnerabilities.
 
 | Item | Available now | Remaining scope |
 |------|---------------|-----------------|
-| Auto-fix PRs | Evidence-based remediation workflow and read-only patch validation | End-to-end automated remediation and PR generation |
+| Auto-fix PRs | Reviewed text patch → isolated worktree → required tests → local commit; explicitly requested publication pushes a new branch and creates a draft PR | Optional autonomous patch inference, broader patch types, and Windows support |
 | Custom rule engine | Trusted local JSON regex rules with bounded UTF-8 file scanning and process execution deadlines | Optional language-aware rules; no sandbox or memory quota for untrusted patterns |
 | External scanners | POSIX execution of installed Semgrep / existing CodeQL databases with SARIF 2.1.0 normalization | Optional installation/database lifecycle management, Windows runners, and broader SARIF coverage |
 | Continuous monitoring | Compatible snapshot comparison and local polling watch, with optional failure on new findings | Optional scanner-backed monitoring, advisory feeds, and external scheduling |
 
-Use `/security-audit custom`, `scanner`, `monitor`, `watch`, or `fix` to request these agent workflows. The bundled Python 3.10+ helper prints JSON (NDJSON for `watch`) to stdout and does not install scanners, apply patches, create PRs, register schedules, or update baselines. See [workflow commands, limitations, and authorization](plugins/security-audit/skills/security-audit/references/advanced-workflows.md).
+Use `/security-audit custom`, `scanner`, `monitor`, `watch`, or `fix` to request these agent workflows. The bundled Python 3.10+ helper prints JSON (NDJSON for `watch`) to stdout. `remediate` applies a reviewed patch in an isolated worktree and creates a local branch and commit; `--publish` additionally pushes and creates a draft PR when authorized. It preserves the original checkout, does not install scanners or register schedules, and never updates monitoring baselines. See [workflow commands, limitations, and authorization](plugins/security-audit/skills/security-audit/references/advanced-workflows.md).
 
-Semgrep execution is verified against an actual scanner. CodeQL runner arguments, result normalization, failure handling, and process cleanup are tested with a stand-in executable; running the native CodeQL engine requires a separately prepared local installation, database, and query suite.
+Semgrep execution is verified against an actual scanner. CodeQL runner contracts are also covered by stand-in executable tests. The `Verify` GitHub Actions workflow provisions a real CodeQL engine on Ubuntu and checks detection against an inert Python fixture, without uploading SARIF or the database. A local native run still requires a separately prepared installation, database, and query suite.
 
 From a repository checkout, run the helper tests with:
 

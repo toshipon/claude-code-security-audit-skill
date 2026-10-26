@@ -2,7 +2,7 @@
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "security-audit",
   "displayName": "Security Audit",
-  "version": "1.9.0",
+  "version": "2.0.0",
   "description": "Full-stack security audit skill for Web (Next.js, Vercel, Supabase), Mobile (iOS, Android, Flutter, React Native), Backend (Python, Go, Rails, Rust), IaC (Terraform, AWS, GCP, Azure), Compliance (PCI-DSS, HIPAA, SOX, GDPR, CCPA, SOC2, ISO27001) and Advanced Detection (supply chain, containers, CI/CD, secrets, LLM/AI). Maps every check to OWASP, CIS and regulatory standards.",
   "author": {
     "name": "toshipon",
