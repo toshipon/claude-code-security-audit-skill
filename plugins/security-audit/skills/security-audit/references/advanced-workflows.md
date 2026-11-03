@@ -1,6 +1,6 @@
 # Advanced Audit Workflows
 
-Initial v2.0 workflows extend the existing audit without replacing evidence review or CVSS assessment. The helper requires Python 3.10+ and the standard library. It runs locally and does not execute commands supplied in rules or SARIF.
+The v2.0 workflows extend the existing audit without replacing evidence review or CVSS assessment. The helper requires Python 3.10+ and the standard library. It runs locally and does not execute commands supplied in rules or SARIF.
 
 Resolve `scripts/audit_workflow.py` relative to the installed skill directory. The examples below run from this repository's root; when installed, substitute that resolved path. Keep output files outside the scanned root so later scans do not scan their own artifacts. JSON is printed to stdout; diagnostics go to stderr. Exit status is 0 on success, 2 on invalid input or tool failure, 1 when `monitor` or `watch --fail-on-new` detects new findings, and 130 on interruption. A watch stream may contain completed events before a later failure; the failed scan itself emits no event or resolution. Do not adopt an incomplete scan as a snapshot.
 
@@ -33,7 +33,31 @@ The helper skips symlinks and `.git`. Included files must be UTF-8 and no larger
 
 ## Semgrep and CodeQL SARIF Import
 
-Run an already installed scanner using reviewed local rules. If a scanner, database, or query pack is unavailable, report **Not Run** with the reason. Do not represent an import test as execution of that scanner.
+Run an already installed scanner using reviewed local rules. If a scanner, database, or query pack is unavailable, report **Not Run** with the reason. Do not represent an import or fake-executable test as execution of that scanner.
+
+### Run an Installed Scanner
+
+On POSIX systems (macOS and Linux), the helper can execute a scanner and import its result in one command:
+
+```bash
+python3 plugins/security-audit/skills/security-audit/scripts/audit_workflow.py run-semgrep \
+  --root /path/to/project --config /path/to/reviewed-semgrep.yml \
+  --timeout 300 > /tmp/semgrep-findings.json
+
+python3 plugins/security-audit/skills/security-audit/scripts/audit_workflow.py run-codeql \
+  --root /path/to/project --database /path/to/existing-database \
+  --suite /path/to/reviewed-suite.qls --timeout 300 > /tmp/codeql-findings.json
+```
+
+`--executable PATH` selects a trusted scanner executable instead of finding `semgrep` or `codeql` on PATH. The helper uses fixed argument arrays without a shell. The configuration or suite must be an existing local file; CodeQL also needs an existing database with matching, up-to-date source. The helper does not install tools, create databases, add `--download`, or request autofixes. Only use reviewed configurations with locally resolved dependencies. It does not block network access by the scanner or by referenced configuration, so local input alone does not guarantee an offline scan.
+
+Scanner output is written to a private temporary SARIF file, then validated through the importer below. Raw stdout and stderr are discarded to avoid exposing source or credentials. Exit zero, a valid SARIF file no larger than 64 MiB, and an unchanged configuration file are required before a snapshot is printed. A nonzero scanner exit is a failed run even if a report was generated. Missing tools, malformed reports, and changed configurations produce status 2 and no snapshot; interruption produces status 130. Timeout is a finite positive number of seconds, defaults to 300, and covers scanner execution; report import and hashing are outside that deadline. On completion, timeout, or interruption, the runner stops its process group, including descendants that remain after the main scanner exits. Processes that deliberately leave that group are outside this cleanup mechanism.
+
+Coverage identity combines the imported scanner metadata with the runner kind, executable path, configuration content hash, and canonical CodeQL database path. Runner snapshots and manually imported snapshots are intentionally incompatible. The helper verifies the selected configuration file before and after execution; changes to referenced files, changes to an executable at the same path, database freshness, and complete scanner coverage still require operator verification. The CodeQL command can update its existing database's query caches. Use a disposable database when its state must be preserved.
+
+The runners currently require POSIX process groups and reject Windows before launching a scanner. Windows users can run their scanner separately and use `import-sarif`.
+
+### Import an Existing Report
 
 Semgrep example using a local configuration and disabled metrics:
 
@@ -95,19 +119,53 @@ This mode polls custom-rule findings in local files. It does not execute externa
 
 ## Remediation and PR Workflow
 
-An audit alone does not authorize code changes. When the user explicitly requests remediation:
+An audit alone does not authorize code changes. First establish that the user requests remediation, review the finding's evidence and intended behavior, and prepare a reviewed patch. The agent determines what to fix from the evidence; the helper does not infer a repair for an arbitrary vulnerability. A request to fix code does not by itself authorize publication. A request to create a PR authorizes the corresponding push and PR creation within that scope.
 
-1. Review the evidence, reproduction conditions, and intended behavior. Limit changes to demonstrated findings and preserve unrelated work.
-2. Prepare an isolated branch and a reviewable patch. Do not place credentials or raw sensitive evidence in a patch or PR.
-3. Validate the proposed patch from the Git repository root:
+The `remediate` command routes to `scripts/remediation.py` and requires POSIX process groups. It uses an isolated temporary Git worktree and preserves the original checkout's HEAD, index, and dirty files. Local mode still creates a branch and commit in the repository; it is not a dry run.
 
-   ```bash
-   python3 plugins/security-audit/skills/security-audit/scripts/audit_workflow.py check-patch \
-     --root /path/to/project --patch /tmp/remediation.patch
-   ```
+### Local Reviewed Remediation
 
-   This runs `git apply --check` only. It requires the Git repository root and does not apply a patch, establish security correctness, or execute tests. Check against the original worktree before applying the proposed change.
-4. Apply the reviewed change only within the user's remediation authorization. Run targeted regression tests, repeat affected audit checks, and review the final diff. Stop on validation errors; report unresolved findings and coverage limitations.
-5. Commit, push, and create a PR only within the user's authorization. A request to create a PR authorizes these publication steps. Use `gh pr create --body-file` with a prepared description covering the demonstrated problem, behavior change, validation, and limitations. Never claim an unexecuted check passed.
+```bash
+python3 plugins/security-audit/skills/security-audit/scripts/audit_workflow.py remediate \
+  --root /path/to/project --patch /tmp/reviewed-remediation.patch \
+  --branch security/fix-reviewed-finding --base HEAD \
+  --test-command '["python3", "-m", "unittest", "discover", "-s", "tests", "-v"]' \
+  --timeout 300 > /tmp/remediation-result.json
+```
 
-The helper provides patch validation; PR generation remains an agent workflow. It does not apply fixes, invoke GitHub, or create branches or commits itself. Dashboard-only findings continue to require the manual remediation guidance in the main skill.
+`--root`, `--patch`, `--branch`, and `--test-command` are required. `--base` defaults to `HEAD` and is resolved to a fixed commit before work begins. The new branch must not already exist. The test command is a JSON array of executable and arguments, run without a shell in the isolated worktree. Choose a targeted regression command that demonstrates the intended repair; a passing unrelated command is not evidence of remediation.
+
+The helper snapshots the reviewed patch privately, checks and applies it to the isolated index, runs the test command, and checks that tests have not changed the staged tree or tracked working files or introduced nonignored untracked files. Ignored test artifacts are permitted. Only the validated patch is committed. The patch itself must be UTF-8 text, and Git must classify the changes as text. Accepted patches add or modify regular files with modes `100644` or `100755`; a new executable text file is allowed. Existing file modes must remain unchanged. Deletion, rename, Git-classified binary content, symlink, and gitlink changes are rejected.
+
+The source repository, test command, Git hooks, and executable tools must be trusted. Commands run with the user's privileges; this is not a sandbox. Dependencies must already be available in the isolated worktree or environment. `--timeout` is a finite positive shared deadline, defaulting to 300 seconds, across the workflow's subprocess execution. Each command uses the remaining time, rather than receiving a fresh timeout. Pure Python file processing is not preempted and can exceed that deadline before the next check; cleanup commands have separate 10-second deadlines. Raw tool and test logs are not printed. Process-group cleanup is used on POSIX; deliberately detached processes are outside this guarantee. On failure, stop and investigate rather than claiming the finding is repaired.
+
+A successful local run retains the result branch and commit and removes its temporary worktree. A test failure produces no remediation commit or push; cleanup removes the temporary worktree and the branch created by that run when safe. Previously existing branches are never reused. Dashboard-only findings continue to require manual remediation guidance from the main skill.
+
+### Publish an Authorized Draft PR
+
+Prepare and review the title and a body file describing the evidence, resulting behavior, executed tests, and material limitations. Do not include source secrets or raw sensitive evidence. Then explicitly request publication:
+
+```bash
+python3 plugins/security-audit/skills/security-audit/scripts/audit_workflow.py remediate \
+  --root /path/to/project --patch /tmp/reviewed-remediation.patch \
+  --branch security/fix-reviewed-finding --base HEAD \
+  --test-command '["python3", "-m", "unittest", "discover", "-s", "tests", "-v"]' \
+  --publish --repo owner/repository --pr-base main \
+  --title 'Fix the reviewed security finding' --body-file /tmp/reviewed-pr.md \
+  --timeout 300 > /tmp/remediation-result.json
+```
+
+Use a fresh branch name for each invocation, including after a successful local run. `--publish` requires `--repo`, `--title`, and `--body-file`. The repository identity must match the GitHub origin. `--base` selects the local starting commit; `--pr-base` selects the PR's target branch and defaults to `main`. Verify that these represent the intended starting point and destination. The remote PR target commit must be available locally and must be an ancestor of the chosen local base; fetch the intended target explicitly beforehand when necessary. Separate origin push URLs are rejected. `--gh-executable PATH` selects a trusted GitHub CLI executable.
+
+Only after patch validation and tests succeed does the helper push its new branch using a new-branch lease and create a **draft** PR with GitHub CLI. Existing remote branches are not overwritten; following tags and recursive submodule pushes are explicitly disabled. The validated public GitHub host is also fixed for GitHub CLI. No publication happens without `--publish`. If an error or interruption occurs after publication starts, the remote branch or PR may already exist: preserve the local result branch, inspect GitHub, and do not automatically retry or delete remote state. Status 2 indicates failure and 130 interruption; neither proves that remote side effects did not occur.
+
+### Read-Only Patch Applicability Check
+
+For applicability checking without creating a branch or commit:
+
+```bash
+python3 plugins/security-audit/skills/security-audit/scripts/audit_workflow.py check-patch \
+  --root /path/to/project --patch /tmp/reviewed-remediation.patch
+```
+
+This runs `git apply --check` only against the original checkout. It requires the Git repository root, does not apply a patch or run tests, and does not establish security correctness. The stricter patch-type policy belongs to `remediate`.

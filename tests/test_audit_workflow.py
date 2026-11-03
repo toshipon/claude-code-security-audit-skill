@@ -1,15 +1,19 @@
 """Exercise the public CLI in disposable projects; no installed scanners required."""
 
+import importlib.util
 import json
+import os
 import queue
 import signal
 import subprocess
 import sys
 import tempfile
+import textwrap
 import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 SCRIPT = (
     Path(__file__).resolve().parents[1]
@@ -589,6 +593,264 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(stdout, "")
         self.assertNotIn("Traceback", stderr)
         self.assertNotIn("SECRET_CANARY_8379", stderr)
+
+    def fake_scanner(self, tool="Semgrep", mode="ok"):
+        executable = self.home / "fake scanner"
+        log = self.home / "scanner-args.json"
+        code = (
+            f"#!{sys.executable}\n"
+            f"MODE = {mode!r}\nTOOL = {tool!r}\nLOG = {str(log)!r}\n"
+            + textwrap.dedent("""\
+                import json, os, pathlib, subprocess, sys, time
+                args = sys.argv[1:]
+                pathlib.Path(LOG).write_text(json.dumps({
+                    "args": args, "cwd": os.getcwd(),
+                    "metrics": os.environ.get("SEMGREP_SEND_METRICS"),
+                    "version_check": os.environ.get("SEMGREP_ENABLE_VERSION_CHECK"),
+                }))
+                print("SECRET_CANARY_8379", flush=True)
+                print("SECRET_CANARY_8379", file=sys.stderr, flush=True)
+                if MODE == "fail": sys.exit(7)
+                if MODE == "missing": sys.exit(0)
+                if MODE == "hang":
+                    time.sleep(30)
+                if MODE in ("descendant", "descendant-exit"):
+                    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+                    pathlib.Path(LOG + ".pid").write_text(str(child.pid))
+                    if MODE == "descendant": time.sleep(30)
+                output = (args[args.index("--output") + 1] if "--output" in args else
+                          next(a.split("=", 1)[1] for a in args if a.startswith("--output=")))
+                if MODE == "malformed":
+                    pathlib.Path(output).write_text("{not-json")
+                    sys.exit(0)
+                if MODE == "oversized":
+                    with pathlib.Path(output).open("wb") as report:
+                        report.seek(64 * 1024 * 1024)
+                        report.write(b"x")
+                    sys.exit(0)
+                if MODE == "changed":
+                    config = args[args.index("--config") + 1] if "--config" in args else args[-1]
+                    pathlib.Path(config).write_text("changed-during-run")
+                data = {"version": "2.1.0", "runs": [{
+                    "tool": {"driver": {"name": TOOL, "version": "1.0", "rules": [{"id": "r1"}]}},
+                    "invocations": [{"executionSuccessful": True}],
+                    "results": [{"ruleId": "r1", "message": {"text": "SECRET_CANARY_8379"},
+                        "locations": [{"physicalLocation": {"artifactLocation": {"uri": "app.py"},
+                            "region": {"startLine": 1}}}]}],
+                }]}
+                if MODE == "failed-report":
+                    data["runs"][0]["invocations"][0]["executionSuccessful"] = False
+                pathlib.Path(output).write_text(json.dumps(data))
+                """)
+        )
+        executable.write_text(code)
+        executable.chmod(0o700)
+        return executable
+
+    def run_scanner(self, tool="Semgrep", mode="ok", *extra, code=0):
+        executable = self.fake_scanner(tool, mode)
+        if tool == "Semgrep":
+            args = ["run-semgrep", "--root", self.root, "--config", self.rules]
+        else:
+            database = self.home / "existing-database"
+            database.mkdir(exist_ok=True)
+            args = [
+                "run-codeql",
+                "--root",
+                self.root,
+                "--database",
+                database,
+                "--suite",
+                self.rules,
+            ]
+        return self.cli(*args, "--executable", executable, *extra, code=code)
+
+    def test_semgrep_runner_normalizes_results_and_uses_local_safe_flags(self):
+        result = self.run_scanner()
+        (finding,) = result["findings"]
+        self.assertEqual(
+            (finding["source"], finding["path"], finding["cvss_status"]),
+            ("Semgrep", "app.py", "Unscored"),
+        )
+        self.assertNotIn("SECRET_CANARY_8379", json.dumps(result))
+        log = json.loads((self.home / "scanner-args.json").read_text())
+        self.assertEqual(Path(log["cwd"]).resolve(), self.root.resolve())
+        self.assertIn("--metrics=off", log["args"])
+        self.assertIn("--disable-version-check", log["args"])
+        self.assertNotIn("--autofix", log["args"])
+        self.assertEqual(log["metrics"], "off")
+
+    def test_codeql_runner_uses_existing_database_and_suite_without_download(self):
+        result = self.run_scanner("CodeQL")
+        self.assertEqual(result["findings"][0]["source"], "CodeQL")
+        args = json.loads((self.home / "scanner-args.json").read_text())["args"]
+        self.assertEqual(args[:2], ["database", "analyze"])
+        self.assertIn("--format=sarifv2.1.0", args)
+        self.assertNotIn("--download", args)
+        self.assertIn(str(self.rules.resolve()), args)
+
+    def test_scanner_failures_never_emit_snapshot_or_raw_logs(self):
+        for mode in (
+            "fail",
+            "missing",
+            "malformed",
+            "changed",
+            "oversized",
+            "failed-report",
+        ):
+            with self.subTest(mode=mode):
+                result = self.run_scanner(mode=mode, code=2)
+                self.assertNotIn("SECRET_CANARY_8379", result.stderr)
+
+    def test_scanner_timeout_never_returns_partial_results(self):
+        started = time.monotonic()
+        result = self.run_scanner("Semgrep", "hang", "--timeout", "0.3", code=2)
+        self.assertLess(time.monotonic() - started, 6)
+        self.assertNotIn("SECRET_CANARY_8379", result.stderr)
+
+    def test_scanner_configuration_changes_invalidate_snapshot_comparison(self):
+        before = self.run_scanner()
+        self.rules.write_text(self.rules.read_text() + "\n")
+        after = self.run_scanner()
+        self.compare(before, after, code=2)
+
+    def test_scanner_missing_executable_or_remote_config_is_not_clean(self):
+        self.cli(
+            "run-semgrep",
+            "--root",
+            self.root,
+            "--config",
+            self.rules,
+            "--executable",
+            self.home / "missing-scanner",
+            code=2,
+        )
+        executable = self.fake_scanner()
+        self.cli(
+            "run-semgrep",
+            "--root",
+            self.root,
+            "--config",
+            "p/default",
+            "--executable",
+            executable,
+            code=2,
+        )
+        self.assertFalse((self.home / "scanner-args.json").exists())
+
+    def test_scanner_descendants_stop_on_timeout_and_after_success(self):
+        for mode, code in (("descendant", 2), ("descendant-exit", 0)):
+            with self.subTest(mode=mode):
+                timeout = "0.5" if code else "2"
+                self.run_scanner("Semgrep", mode, "--timeout", timeout, code=code)
+                pid = int((self.home / "scanner-args.json.pid").read_text())
+
+                def cleanup(pid=pid):
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+
+                self.addCleanup(cleanup)
+                state = subprocess.run(
+                    ["ps", "-p", str(pid), "-o", "stat="],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                ).stdout.strip()
+                self.assertTrue(not state or state.startswith("Z"), state)
+
+    def test_codeql_local_suite_with_pack_syntax_characters_is_unambiguous(self):
+        original = self.rules
+        self.rules = self.home / "rules@v1.qls"
+        self.rules.write_bytes(original.read_bytes())
+        self.run_scanner("CodeQL")
+        args = json.loads((self.home / "scanner-args.json").read_text())["args"]
+        self.assertIn("path:" + str(self.rules.resolve()), args)
+
+    def test_scanner_interrupt_does_not_emit_logs_or_a_snapshot(self):
+        executable = self.fake_scanner(mode="hang")
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                str(SCRIPT),
+                "run-semgrep",
+                "--root",
+                str(self.root),
+                "--config",
+                str(self.rules),
+                "--executable",
+                str(executable),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+        def cleanup():
+            if process.poll() is None:
+                process.kill()
+            process.communicate(timeout=5)
+
+        self.addCleanup(cleanup)
+        deadline = time.monotonic() + 5
+        while (
+            not (self.home / "scanner-args.json").is_file()
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.01)
+        self.assertTrue((self.home / "scanner-args.json").is_file())
+        process.send_signal(signal.SIGINT)
+        stdout, stderr = process.communicate(timeout=5)
+        self.assertEqual(process.returncode, 130, stderr)
+        self.assertEqual(stdout, "")
+        self.assertNotIn("Traceback", stderr)
+        self.assertNotIn("SECRET_CANARY_8379", stderr)
+
+    def test_darwin_cleanup_accepts_only_proven_inactive_process_groups(self):
+        spec = importlib.util.spec_from_file_location("cleanup_under_test", SCRIPT)
+        module = importlib.util.module_from_spec(spec)
+        with mock.patch.object(sys, "path", [str(SCRIPT.parent), *sys.path]):
+            spec.loader.exec_module(module)
+        for states, should_accept in (
+            ("", True),
+            ("1234 Z\n", True),
+            ("1234 S\n", False),
+        ):
+            with self.subTest(states=states):
+                process = mock.Mock(pid=1234)
+                process.poll.return_value = 0
+                process.wait.return_value = 0
+                ps = subprocess.CompletedProcess([], 0, stdout=states, stderr="")
+                with (
+                    mock.patch.object(module.sys, "platform", "darwin"),
+                    mock.patch.object(module.os, "killpg", side_effect=PermissionError),
+                    mock.patch.object(module.subprocess, "run", return_value=ps),
+                ):
+                    if should_accept:
+                        module.stop_scanner(process)
+                    else:
+                        with self.assertRaises(PermissionError):
+                            module.stop_scanner(process)
+
+    def test_darwin_cleanup_does_not_hide_unknown_or_live_group_failures(self):
+        spec = importlib.util.spec_from_file_location("cleanup_under_test", SCRIPT)
+        module = importlib.util.module_from_spec(spec)
+        with mock.patch.object(sys, "path", [str(SCRIPT.parent), *sys.path]):
+            spec.loader.exec_module(module)
+        for leader, ps_code in ((None, 0), (0, 1)):
+            with self.subTest(leader=leader, ps_code=ps_code):
+                process = mock.Mock(pid=1234)
+                process.poll.return_value = leader
+                process.wait.return_value = 0
+                ps = subprocess.CompletedProcess([], ps_code, stdout="", stderr="")
+                with (
+                    mock.patch.object(module.sys, "platform", "darwin"),
+                    mock.patch.object(module.os, "killpg", side_effect=PermissionError),
+                    mock.patch.object(module.subprocess, "run", return_value=ps),
+                    self.assertRaises(PermissionError),
+                ):
+                    module.stop_scanner(process)
 
 
 if __name__ == "__main__":

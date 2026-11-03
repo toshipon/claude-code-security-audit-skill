@@ -1,0 +1,124 @@
+name: Verify
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: verify-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.10', '3.14']
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -v
+
+  native-codeql:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Prepare inert Python fixture
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/codeql-fixture"
+          cat > "$RUNNER_TEMP/codeql-fixture/app.py" <<'PY'
+          from flask import Flask, request
+          app = Flask(__name__)
+
+          @app.route("/evaluate")
+          def evaluate():
+              return str(eval(request.args["expression"]))
+          PY
+      - name: Initialize CodeQL
+        id: codeql
+        uses: github/codeql-action/init@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          languages: python
+          build-mode: none
+          source-root: ${{ runner.temp }}/codeql-fixture
+          db-location: ${{ runner.temp }}/codeql-db
+          tools: linked
+          trap-caching: false
+          dependency-caching: false
+          debug: false
+      - name: Extract and finalize only the temporary fixture
+        shell: bash
+        working-directory: ${{ runner.temp }}/codeql-fixture
+        env:
+          CODEQL_BIN: ${{ steps.codeql.outputs.codeql-path }}
+        run: |
+          # The analyze action uses GITHUB_WORKSPACE as its extraction working
+          # directory, even when source-root points outside the checkout.
+          # Complete init's database locally; do not publish SARIF or the DB.
+          "$CODEQL_BIN" database trace-command \
+            --use-build-mode \
+            --working-dir "$RUNNER_TEMP/codeql-fixture" \
+            "$RUNNER_TEMP/codeql-db/python"
+          "$CODEQL_BIN" database finalize \
+            --working-dir "$RUNNER_TEMP/codeql-fixture" \
+            "$RUNNER_TEMP/codeql-db/python"
+      - name: Verify runner against the real CodeQL engine
+        shell: bash
+        env:
+          CODEQL_BIN: ${{ steps.codeql.outputs.codeql-path }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+
+          cli = Path(os.environ["CODEQL_BIN"])
+          fixture = Path(os.environ["RUNNER_TEMP"]) / "codeql-fixture"
+          database = str(Path(os.environ["RUNNER_TEMP"]) / "codeql-db/python")
+          suites = sorted(cli.parent.rglob("python-security-extended.qls"))
+          if len(suites) != 1:
+              raise SystemExit(f"Expected one bundled Python suite, found {len(suites)}")
+          result = subprocess.run(
+              [
+                  "python3",
+                  "plugins/security-audit/skills/security-audit/scripts/audit_workflow.py",
+                  "run-codeql",
+                  "--root", str(fixture),
+                  "--executable", str(cli),
+                  "--database", database,
+                  "--suite", str(suites[0]),
+                  "--timeout", "600",
+              ],
+              check=True,
+              capture_output=True,
+              text=True,
+          )
+          findings = json.loads(result.stdout)["findings"]
+          matching = [
+              finding for finding in findings
+              if finding["rule_id"] == "py/code-injection"
+              and finding["path"] == "app.py"
+          ]
+          print(f"Findings: {len(findings)}; expected matches: {len(matching)}", flush=True)
+          if not matching:
+              raise SystemExit("Expected py/code-injection finding in app.py")
+          if any(finding["cvss_status"] != "Unscored" for finding in matching):
+              raise SystemExit("Scanner findings must remain Unscored")
+          for finding in matching:
+              print(f"{finding['rule_id']}: {finding['path']}")
+          PY

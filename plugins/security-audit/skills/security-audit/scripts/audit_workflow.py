@@ -8,6 +8,7 @@ import math
 import multiprocessing
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -15,6 +16,8 @@ import tempfile
 import time
 from pathlib import Path
 from urllib.parse import unquote, urljoin, urlparse
+
+from remediation import RemediationError, add_arguments, remediate
 
 MAX_FILE_SIZE = 1024 * 1024
 LEVELS = {"none", "note", "warning", "error"}
@@ -581,6 +584,154 @@ def nonnegative_integer(value):
     return result
 
 
+def file_hash(path):
+    value = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(65536), b""):
+            value.update(chunk)
+    return value.hexdigest()
+
+
+def stop_scanner(process):
+    """Stop the whole new session, including children left after the leader exits."""
+
+    def group_has_finished():
+        # Darwin may report EPERM instead of ESRCH for an exited process group.
+        # Only tolerate that result after independently ruling out live members.
+        if sys.platform != "darwin" or process.poll() is None:
+            return False
+        try:
+            result = subprocess.run(
+                ["/bin/ps", "-axo", "pgid=,stat="],
+                capture_output=True,
+                text=True,
+                timeout=2,
+                check=False,
+            )
+            if result.returncode != 0:
+                return False
+            for row in result.stdout.splitlines():
+                if not row.strip():
+                    continue
+                group, state = row.split()
+                if int(group) == process.pid and not state.startswith("Z"):
+                    return False
+            return True
+        except (OSError, ValueError, subprocess.SubprocessError):
+            return False
+
+    def signal_group(value):
+        try:
+            os.killpg(process.pid, value)
+        except ProcessLookupError:
+            pass
+        except PermissionError:
+            if not group_has_finished():
+                raise
+
+    try:
+        signal_group(signal.SIGTERM)
+        try:
+            process.wait(timeout=0.2)
+        except subprocess.TimeoutExpired:
+            pass
+    finally:
+        try:
+            signal_group(signal.SIGKILL)
+        finally:
+            process.wait()
+
+
+def run_scanner(args):
+    require(os.name == "posix", "Scanner runners require POSIX")
+    root = root_dir(args.root)
+    executable = shutil.which(args.executable)
+    require(executable is not None, "Scanner executable unavailable")
+    executable = str(Path(executable).resolve(strict=True))
+    kind = "semgrep" if args.command == "run-semgrep" else "codeql"
+    config = Path(args.config if kind == "semgrep" else args.suite).resolve(strict=True)
+    require(config.is_file(), "Scanner configuration must be a local file")
+    before = file_hash(config)
+    database = root_dir(args.database) if kind == "codeql" else None
+    environment = os.environ.copy()
+    with tempfile.TemporaryDirectory(prefix="audit-scanner-") as directory:
+        report = Path(directory) / "report.sarif"
+        if kind == "semgrep":
+            command = [
+                executable,
+                "scan",
+                "--config",
+                str(config),
+                "--metrics=off",
+                "--disable-version-check",
+                "--sarif",
+                "--output",
+                str(report),
+                str(root),
+            ]
+            environment.update(
+                SEMGREP_SEND_METRICS="off", SEMGREP_ENABLE_VERSION_CHECK="0"
+            )
+        else:
+            suite = (
+                "path:" + str(config)
+                if any(c in str(config) for c in "@:")
+                else str(config)
+            )
+            command = [
+                executable,
+                "database",
+                "analyze",
+                "--format=sarifv2.1.0",
+                "--output=" + str(report),
+                "--",
+                str(database),
+                suite,
+            ]
+        started = time.monotonic()
+        process = subprocess.Popen(
+            command,
+            cwd=root,
+            env=environment,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        try:
+            remaining = args.timeout - (time.monotonic() - started)
+            require(remaining > 0, "Scanner timeout exceeded")
+            # Small waits also support finite values beyond the OS timeout range.
+            while process.poll() is None:
+                remaining = args.timeout - (time.monotonic() - started)
+                require(remaining > 0, "Scanner timeout exceeded")
+                try:
+                    process.wait(timeout=min(remaining, 60.0))
+                except subprocess.TimeoutExpired:
+                    pass
+            require(process.returncode == 0, "Scanner execution failed")
+        finally:
+            stop_scanner(process)
+        require(
+            config.is_file() and file_hash(config) == before,
+            "Scanner configuration changed during execution",
+        )
+        require(
+            report.is_file() and report.stat().st_size <= 64 * 1024 * 1024,
+            "Scanner report missing or exceeds size limit",
+        )
+        result = sarif(argparse.Namespace(root=str(root), input=str(report)))
+        result["coverage"]["rules_digest"] = digest(
+            {
+                "imported_digest": result["coverage"]["rules_digest"],
+                "runner": kind,
+                "config_hash": before,
+                "database": str(database) if database else None,
+                "executable": executable,
+            }
+        )
+        return result
+
+
 def check_patch(args):
     root = root_dir(args.root)
     patch = Path(args.patch).resolve(strict=True)
@@ -619,6 +770,18 @@ def main():
         )
         if name == "scan":
             command.add_argument("--timeout", type=positive_seconds, default=30.0)
+    for name in ("run-semgrep", "run-codeql"):
+        command = commands.add_parser(name)
+        command.add_argument("--root", required=True)
+        command.add_argument(
+            "--executable", default="semgrep" if name == "run-semgrep" else "codeql"
+        )
+        command.add_argument("--timeout", type=positive_seconds, default=300.0)
+        if name == "run-semgrep":
+            command.add_argument("--config", required=True)
+        else:
+            command.add_argument("--database", required=True)
+            command.add_argument("--suite", required=True)
     command = commands.add_parser("watch")
     command.add_argument("--root", required=True)
     command.add_argument("--rules", required=True)
@@ -631,19 +794,26 @@ def main():
     command.add_argument("--baseline", required=True)
     command.add_argument("--current", required=True)
     command.add_argument("--fail-on-new", action="store_true")
+    add_arguments(commands, positive_seconds)
     args = parser.parse_args()
     try:
+        if args.command == "remediate":
+            result = remediate(args, stop_scanner)
+            print(json.dumps(result, sort_keys=True, ensure_ascii=True))
+            return 0
         if args.command == "watch":
             return watch(args)
         result = {
             "scan": scan,
+            "run-semgrep": run_scanner,
+            "run-codeql": run_scanner,
             "import-sarif": sarif,
             "monitor": monitor,
             "check-patch": check_patch,
         }[args.command](args)
     except KeyboardInterrupt:
         return 130
-    except WorkflowError as error:
+    except (WorkflowError, RemediationError) as error:
         print("Audit workflow failed: " + str(error) + ".", file=sys.stderr)
         return 2
     except (
