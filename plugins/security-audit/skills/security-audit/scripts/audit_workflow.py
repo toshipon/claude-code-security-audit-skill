@@ -17,6 +17,8 @@ import time
 from pathlib import Path
 from urllib.parse import unquote, urljoin, urlparse
 
+from remediation import RemediationError, add_arguments, remediate
+
 MAX_FILE_SIZE = 1024 * 1024
 LEVELS = {"none", "note", "warning", "error"}
 
@@ -592,20 +594,50 @@ def file_hash(path):
 
 def stop_scanner(process):
     """Stop the whole new session, including children left after the leader exits."""
-    try:
+
+    def group_has_finished():
+        # Darwin may report EPERM instead of ESRCH for an exited process group.
+        # Only tolerate that result after independently ruling out live members.
+        if sys.platform != "darwin" or process.poll() is None:
+            return False
         try:
-            os.killpg(process.pid, signal.SIGTERM)
+            result = subprocess.run(
+                ["/bin/ps", "-axo", "pgid=,stat="],
+                capture_output=True,
+                text=True,
+                timeout=2,
+                check=False,
+            )
+            if result.returncode != 0:
+                return False
+            for row in result.stdout.splitlines():
+                if not row.strip():
+                    continue
+                group, state = row.split()
+                if int(group) == process.pid and not state.startswith("Z"):
+                    return False
+            return True
+        except (OSError, ValueError, subprocess.SubprocessError):
+            return False
+
+    def signal_group(value):
+        try:
+            os.killpg(process.pid, value)
         except ProcessLookupError:
             pass
+        except PermissionError:
+            if not group_has_finished():
+                raise
+
+    try:
+        signal_group(signal.SIGTERM)
         try:
             process.wait(timeout=0.2)
         except subprocess.TimeoutExpired:
             pass
     finally:
         try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
+            signal_group(signal.SIGKILL)
         finally:
             process.wait()
 
@@ -762,8 +794,13 @@ def main():
     command.add_argument("--baseline", required=True)
     command.add_argument("--current", required=True)
     command.add_argument("--fail-on-new", action="store_true")
+    add_arguments(commands, positive_seconds)
     args = parser.parse_args()
     try:
+        if args.command == "remediate":
+            result = remediate(args, stop_scanner)
+            print(json.dumps(result, sort_keys=True, ensure_ascii=True))
+            return 0
         if args.command == "watch":
             return watch(args)
         result = {
@@ -776,7 +813,7 @@ def main():
         }[args.command](args)
     except KeyboardInterrupt:
         return 130
-    except WorkflowError as error:
+    except (WorkflowError, RemediationError) as error:
         print("Audit workflow failed: " + str(error) + ".", file=sys.stderr)
         return 2
     except (

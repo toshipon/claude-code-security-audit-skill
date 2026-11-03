@@ -161,7 +161,7 @@ Before target selection, route these explicit workflow requests to `references/a
 - `/security-audit scanner [options]`: run an installed Semgrep or CodeQL scanner with `run-semgrep` or `run-codeql` on POSIX, or import existing SARIF with `import-sarif`. Use reviewed local configuration and an existing CodeQL database; report unavailable tools or databases as **Not Run**.
 - `/security-audit monitor [options]`: compare compatible findings snapshots with `monitor`; do not create schedules or update baselines automatically.
 - `/security-audit watch [options]`: on an explicit monitoring request, repeatedly run local custom rules against a fixed baseline with `watch`; choose a bounded `--iterations` count for verification and stop on scan errors. Do not register a service or replace the baseline.
-- `/security-audit fix [options]`: only when the user requests remediation, prepare evidence-backed edits and validate a patch with `check-patch`, then follow the review and authorization workflow in the guide.
+- `/security-audit fix [options]`: only when the user requests remediation, prepare an evidence-backed, reviewed patch, then use `remediate` with a required trusted test command to create an isolated local commit. Add `--publish` only when the user authorizes pushing and PR creation; follow the guide.
 
 These are agent instructions, not standalone shell commands. Resolve `scripts/audit_workflow.py` relative to this skill directory; it requires Python 3.10+ and uses only the standard library. Preserve coverage limitations and `Unscored` status in the audit report. Scanner levels are not CVSS severity. An audit request alone does not authorize remediation or publication.
 

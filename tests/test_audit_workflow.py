@@ -1,5 +1,6 @@
 """Exercise the public CLI in disposable projects; no installed scanners required."""
 
+import importlib.util
 import json
 import os
 import queue
@@ -12,6 +13,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 SCRIPT = (
     Path(__file__).resolve().parents[1]
@@ -739,7 +741,8 @@ class WorkflowTests(unittest.TestCase):
     def test_scanner_descendants_stop_on_timeout_and_after_success(self):
         for mode, code in (("descendant", 2), ("descendant-exit", 0)):
             with self.subTest(mode=mode):
-                self.run_scanner("Semgrep", mode, "--timeout", "0.5", code=code)
+                timeout = "0.5" if code else "2"
+                self.run_scanner("Semgrep", mode, "--timeout", timeout, code=code)
                 pid = int((self.home / "scanner-args.json.pid").read_text())
 
                 def cleanup(pid=pid):
@@ -803,6 +806,51 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(stdout, "")
         self.assertNotIn("Traceback", stderr)
         self.assertNotIn("SECRET_CANARY_8379", stderr)
+
+    def test_darwin_cleanup_accepts_only_proven_inactive_process_groups(self):
+        spec = importlib.util.spec_from_file_location("cleanup_under_test", SCRIPT)
+        module = importlib.util.module_from_spec(spec)
+        with mock.patch.object(sys, "path", [str(SCRIPT.parent), *sys.path]):
+            spec.loader.exec_module(module)
+        for states, should_accept in (
+            ("", True),
+            ("1234 Z\n", True),
+            ("1234 S\n", False),
+        ):
+            with self.subTest(states=states):
+                process = mock.Mock(pid=1234)
+                process.poll.return_value = 0
+                process.wait.return_value = 0
+                ps = subprocess.CompletedProcess([], 0, stdout=states, stderr="")
+                with (
+                    mock.patch.object(module.sys, "platform", "darwin"),
+                    mock.patch.object(module.os, "killpg", side_effect=PermissionError),
+                    mock.patch.object(module.subprocess, "run", return_value=ps),
+                ):
+                    if should_accept:
+                        module.stop_scanner(process)
+                    else:
+                        with self.assertRaises(PermissionError):
+                            module.stop_scanner(process)
+
+    def test_darwin_cleanup_does_not_hide_unknown_or_live_group_failures(self):
+        spec = importlib.util.spec_from_file_location("cleanup_under_test", SCRIPT)
+        module = importlib.util.module_from_spec(spec)
+        with mock.patch.object(sys, "path", [str(SCRIPT.parent), *sys.path]):
+            spec.loader.exec_module(module)
+        for leader, ps_code in ((None, 0), (0, 1)):
+            with self.subTest(leader=leader, ps_code=ps_code):
+                process = mock.Mock(pid=1234)
+                process.poll.return_value = leader
+                process.wait.return_value = 0
+                ps = subprocess.CompletedProcess([], ps_code, stdout="", stderr="")
+                with (
+                    mock.patch.object(module.sys, "platform", "darwin"),
+                    mock.patch.object(module.os, "killpg", side_effect=PermissionError),
+                    mock.patch.object(module.subprocess, "run", return_value=ps),
+                    self.assertRaises(PermissionError),
+                ):
+                    module.stop_scanner(process)
 
 
 if __name__ == "__main__":
